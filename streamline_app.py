@@ -8,14 +8,35 @@ import qrcode
 import os
 import io
 import tempfile
-import boto3
-import botocore
-import botocore.exceptions
 
+# Check for secrets before proceeding
+def check_secrets():
+    required_secrets = [
+        'account',
+        'user',
+        'password',
+        'warehouse',
+        'database',
+        'schema'
+    ]
+    
+    missing_secrets = []
+    for secret in required_secrets:
+        if secret not in st.secrets:
+            missing_secrets.append(secret)
+    
+    if missing_secrets:
+        st.error("⚠️ Missing required configuration!")
+        st.write("The following secrets are missing:")
+        for secret in missing_secrets:
+            st.write(f"- {secret}")
+        st.write("Please add these to your .streamlit/secrets.toml file if running locally, or to your Streamlit Cloud secrets if deploying.")
+        st.stop()
 
-attendance_status = {}
+# Run the secrets check
+check_secrets()
 
-# Snowflake connection parameters
+# If we get here, all required secrets are present
 CONNECTION_PARAMETERS = {
     "account": st.secrets["account"],
     "user": st.secrets["user"],
@@ -24,167 +45,51 @@ CONNECTION_PARAMETERS = {
     "schema": st.secrets["schema"],
     "warehouse": st.secrets["warehouse"],
 }
-aws_access_key_id = st.secrets["access_key"]
-aws_secret_access_key = st.secrets["secret_key"]
-aws_region = st.secrets["region"]
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=aws_access_key_id,
-    aws_secret_access_key=aws_secret_access_key,
-    region_name=aws_region,
-)
 
-
-def generate_and_store_qr_codes():
-
-    aws_access_key_id = st.secrets["access_key"]
-    aws_secret_access_key = st.secrets["secret_key"]
-    aws_region = st.secrets["region"]
-    conn = snowflake.connector.connect(
-        user=CONNECTION_PARAMETERS["user"],
-        password=CONNECTION_PARAMETERS["password"],
-        account=CONNECTION_PARAMETERS["account"],
-        warehouse=CONNECTION_PARAMETERS["warehouse"],
-        database=CONNECTION_PARAMETERS["database"],
-        schema=CONNECTION_PARAMETERS["schema"],
-    )
-    cursor = conn.cursor()
-
-    # Fetch attendee IDs and names from the EMP table
-    cursor.execute("SELECT ATTENDEE_ID, NAME, QR_CODE FROM EMP")
-    employee_data = cursor.fetchall()
-
-    new_qr_codes_generated = 0  # Initialize the counter
-
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=aws_access_key_id,
-        aws_secret_access_key=aws_secret_access_key,
-        region_name=aws_region,
-    )
-
-    for attendee_id, name, qr_code in employee_data:
-        if qr_code:
-            continue
-
-        qr_data = f"{attendee_id} {name}"  # Combine ID and name in QR code data
-
-        qr = qrcode.QRCode(
-            version=1,
-            error_correction=qrcode.constants.ERROR_CORRECT_L,
-            box_size=10,
-            border=4,
-        )
-        qr.add_data(qr_data)
-        qr.make(fit=True)
-        qr_img = qr.make_image(fill_color="black", back_color="white")
-
-        # Save QR code image as temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
-            qr_img.save(temp_file, format="PNG")
-
-        # Upload QR code image to S3 bucket
-        s3_file_name = f"qrcodes/{attendee_id}.png"
-        s3.upload_file(temp_file.name, "qrstore", s3_file_name)
-
-        # Clean up temporary file
-        os.unlink(temp_file.name)
-
-        # Update QR_CODE column with S3 file path
-        s3_file_path = f"s3://qrstore/{s3_file_name}"
-        update_query = "UPDATE EMP SET QR_CODE = %s WHERE ATTENDEE_ID = %s"
-        cursor.execute(update_query, (s3_file_path, attendee_id))
-        conn.commit()
-
-        new_qr_codes_generated += 1  # Increment the counter
-    cursor.close()
-    conn.close()
-
-    return new_qr_codes_generated
-
-
-
-def mark_attendance(attendee_id):
-    conn = snowflake.connector.connect(
-        user=CONNECTION_PARAMETERS['user'],
-        password=CONNECTION_PARAMETERS['password'],
-        account=CONNECTION_PARAMETERS['account'],
-        warehouse=CONNECTION_PARAMETERS['warehouse'],
-        database=CONNECTION_PARAMETERS['database'],
-        schema=CONNECTION_PARAMETERS['schema']
-    )
-    cursor = conn.cursor()
-
-    print(f"Marking attendance for attendee ID: {attendee_id}")  # Debug print
-
-    # Update attendance status
-    update_query = "UPDATE EMP SET ATTENDED = TRUE WHERE ATTENDEE_ID = %s"
+def test_connection():
     try:
-        cursor.execute(update_query, (attendee_id,))
-        conn.commit()
-        print("Attendance marked successfully.")  # Debug print
+        conn = snowflake.connector.connect(**CONNECTION_PARAMETERS)
+        cursor = conn.cursor()
+        cursor.execute('SELECT current_version()')
+        version = cursor.fetchone()[0]
+        cursor.close()
+        conn.close()
+        return True, version
     except Exception as e:
-        print(f"Error while marking attendance: {e}")  # Debug print
-        conn.rollback()
+        return False, str(e)
 
-    # Close the cursor and connection
-    cursor.close()
-    conn.close()
-
-
-
-def query_attendance_data():
-    conn = snowflake.connector.connect(
-        user=CONNECTION_PARAMETERS['user'],
-        password=CONNECTION_PARAMETERS['password'],
-        account=CONNECTION_PARAMETERS['account'],
-        warehouse=CONNECTION_PARAMETERS['warehouse'],
-        database=CONNECTION_PARAMETERS['database'],
-        schema=CONNECTION_PARAMETERS['schema']
-    )
-    cursor = conn.cursor()
-
-    # Query attendance data
-    cursor.execute("SELECT ATTENDEE_ID, ATTENDED FROM EMP")
-    data = cursor.fetchall()
-
-    cursor.close()
-    conn.close()
-    return data
-
-
-# Function to generate attendance statistics
-def generate_attendance_statistics(data):
-    total_attendees = len(data)
-    total_attended = sum(1 for _, attended in data if attended)
-    total_not_attended = total_attendees - total_attended
-    return {
-        "Total Attendees": total_attendees,
-        "Total Attended": total_attended,
-        "Total Not Attended": total_not_attended,
-    }
-
-
-primary_color = "#007BFF"
-secondary_color = "#6C757D"
+# UI Configuration
 st.set_page_config(
     page_title="NexusPassCheck",
     page_icon=":passport_control:",
     layout="wide",
 )
 
-# Streamlit app
+# Test the connection and show status
 st.title("NexusPassCheck")
 
-# Custom menu options with emojis
+with st.sidebar:
+    st.write("Connection Status:")
+    success, result = test_connection()
+    if success:
+        st.success("✅ Connected to Snowflake")
+        st.info(f"Version: {result}")
+    else:
+        st.error("❌ Connection Failed")
+        st.error(f"Error: {result}")
+        st.stop()
+
+# Only show the menu if connection is successful
 menu_choices = {
     "QR Code Scanner": "📷 QR Code Scanner",
     "Attendance Statistics": "📊 Attendance Statistics",
     "Generate QR Codes": "🔐 Generate QR Codes",
-    
 }
 
 menu_choice = st.sidebar.radio("Select Page", list(menu_choices.values()))
+
+# Your existing menu handling code here...
+# (The rest of your application code remains the same)
 st.markdown(
     f"""
     <style>
